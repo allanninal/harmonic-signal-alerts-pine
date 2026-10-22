@@ -1,0 +1,392 @@
+// This source code is subject to the terms of the PolyForm Noncommercial License 1.0.0
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+// © allanninal
+
+//@version=6
+
+//@description Harmonic Signal Alerts: ABCD, Gartley and Bat patterns from confirmed swing points. Each pattern is drawn
+// (XABCD lines, reversal zone, point labels) and marked on the closed bar where price reached its reversal zone. A swing
+// is known only after `right` more bars, and every decision uses closed bars, so nothing moves or disappears afterwards.
+// The exact rules are tests/reference.py.
+indicator("Harmonic Signal Alerts", shorttitle = "Harmonic Alerts", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+
+// ───────────────────────────── Constants ─────────────────────────────
+const int MAX_SWINGS = 8       // swings kept (a pattern needs the last 4)
+const int ZONE_BARS  = 10      // the reversal zone box reaches this many bars past the completion bar
+
+const string GROUP_PATTERNS = "Patterns"
+const string GROUP_SWINGS   = "Swings and ratios"
+const string GROUP_DISPLAY  = "Display"
+
+// ───────────────────────────── Inputs ─────────────────────────────
+bool useAbcd    = input.bool(true, "ABCD", group = GROUP_PATTERNS, tooltip = "BC = 38.2-88.6% of AB; D where CD equals AB.")
+bool useGartley = input.bool(true, "Gartley", group = GROUP_PATTERNS, tooltip = "AB = 61.8% of XA, BC = 38.2-88.6% of AB; D at 78.6% of XA, where CD is 113-161.8% of BC.")
+bool useBat     = input.bool(true, "Bat", group = GROUP_PATTERNS, tooltip = "AB = 38.2-50% of XA, BC = 38.2-88.6% of AB; D at 88.6% of XA, where CD is 161.8-261.8% of BC.")
+
+int   leftBars  = input.int(10, "Swing: bars on the left", minval = 1, maxval = 100, group = GROUP_SWINGS, tooltip = "A swing high is higher than each of this many bars before it (a swing low lower).")
+int   rightBars = input.int(5, "Swing: bars on the right", minval = 1, maxval = 50, group = GROUP_SWINGS, tooltip = "A swing high is not below any of this many bars after it, so it is known this many bars later: the confirmation delay.")
+float tolPct    = input.float(5.0, "Ratio tolerance, %", minval = 0, maxval = 20, step = 0.5, group = GROUP_SWINGS, tooltip = "Every ratio and range end is widened by this share of itself (5% turns 0.618 into 0.587-0.649).")
+float zonePct   = input.float(3.0, "Reversal zone half-width, % of XA", minval = 0.1, maxval = 20, step = 0.5, group = GROUP_SWINGS, tooltip = "The reversal zone is the D level plus and minus this share of XA (ABCD: of AB).")
+
+bool  showLines  = input.bool(true, "XABCD lines", group = GROUP_DISPLAY, tooltip = "Solid legs X-A-B-C-D, dotted X-B and B-D (ABCD: A-C and B-D).")
+bool  showZone   = input.bool(true, "Reversal zone", group = GROUP_DISPLAY, tooltip = "A dotted box from C to a few bars past the completion bar, between the zone's near and far edges.")
+bool  showLabels = input.bool(true, "Point and pattern labels", group = GROUP_DISPLAY, tooltip = "X, A, B, C at the swings and D with the pattern names. TradingView keeps the latest 500 lines, 500 labels and 500 boxes of a script.")
+color bullColor  = input.color(#089981, "Bullish", group = GROUP_DISPLAY, inline = "colors")
+color bearColor  = input.color(#F23645, "Bearish", group = GROUP_DISPLAY, inline = "colors")
+
+// ───────────────────────────── Types ─────────────────────────────
+//@type A confirmed swing point.
+//@field kind 1 = swing high, -1 = swing low.
+//@field price The high or low of the swing bar.
+//@field bar Bar index of the swing bar.
+type Swing
+    int   kind
+    float price
+    int   bar
+
+//@type A pattern whose X, A, B and C are set, waiting for price to reach its reversal zone.
+//@field pat Pattern index (0 ABCD, 1 Gartley, 2 Bat).
+//@field dir 1 = bullish (D below C), -1 = bearish.
+//@field key The D level the ratios project.
+//@field scale XA (ABCD: AB), the unit of the zone width.
+//@field nearZ Zone edge on C's side.
+//@field farZ Zone edge beyond the key level.
+//@field xb Bar of X (-1 for ABCD).
+//@field ab Bar of A.
+//@field bb Bar of B.
+//@field cb Bar of C.
+//@field xp Price of X.
+//@field ap Price of A.
+//@field bp Price of B.
+//@field cp Price of C.
+//@field ext Lowest low (bullish) or highest high (bearish) since C.
+//@field extBar Bar of that extreme: D.
+//@field worst Lowest (highest) close since C.
+type Cand
+    int   pat
+    int   dir
+    float key
+    float scale
+    float nearZ
+    float farZ
+    int   xb
+    int   ab
+    int   bb
+    int   cb
+    float xp
+    float ap
+    float bp
+    float cp
+    float ext    = na
+    int   extBar = -1
+    float worst  = na
+
+//@type A completed pattern.
+//@field bar The bar it became known (price reached the zone on a closed bar).
+//@field dir 1 = bullish, -1 = bearish.
+//@field pat Pattern index.
+//@field xb Bar of X (-1 for ABCD).
+//@field ab Bar of A.
+//@field bb Bar of B.
+//@field cb Bar of C.
+//@field db Bar of D.
+//@field xp Price of X.
+//@field ap Price of A.
+//@field bp Price of B.
+//@field cp Price of C.
+//@field dp Price of D.
+//@field nearZ Zone edge on C's side.
+//@field farZ Zone edge beyond the key level.
+type Event
+    int   bar
+    int   dir
+    int   pat
+    int   xb
+    int   ab
+    int   bb
+    int   cb
+    int   db
+    float xp
+    float ap
+    float bp
+    float cp
+    float dp
+    float nearZ
+    float farZ
+
+// ───────────────────────────── Pattern table ─────────────────────────────
+// Index = bit in the pattern masks (the same numbering as the MetaTrader editions).
+var array<string> PATTERN_NAMES = array.from("ABCD", "Gartley", "Bat")
+// Per pattern: AB/XA low, high; BC/AB low, high; D level (share of XA; ABCD: CD = AB); CD/BC low, high (0 = no check).
+var array<float> RATIOS = array.from(0.0, 0.0, 0.382, 0.886, 1.0, 0.0, 0.0, 0.618, 0.618, 0.382, 0.886, 0.786, 1.13, 1.618, 0.382, 0.50, 0.382, 0.886, 0.886, 1.618, 2.618)
+
+// ───────────────────────────── Functions ─────────────────────────────
+//@function Bit value of a pattern index, used to build the masks.
+//@param i Pattern index.
+//@returns 2 to the power i.
+bit(int i) => int(math.pow(2, i))
+
+//@function Whether bit i is set in a mask.
+//@param mask Bit mask.
+//@param i Bit index.
+//@returns true when set.
+hasBit(int mask, int i) => int(mask / bit(i)) % 2 == 1
+
+//@function Joins the names of the patterns whose bit is set in a mask.
+//@param mask Pattern bit mask.
+//@returns The joined names, or "" for an empty mask.
+maskNames(int mask) =>
+    string out = ""
+    for i = 0 to array.size(PATTERN_NAMES) - 1
+        if hasBit(mask, i)
+            out := out == "" ? array.get(PATTERN_NAMES, i) : out + ", " + array.get(PATTERN_NAMES, i)
+    out
+
+//@function Whether a ratio lies in a range widened by the tolerance.
+//@param v The ratio.
+//@param lo Low end.
+//@param hi High end.
+//@param tol Relative widening.
+//@returns true when lo x (1 - tol) <= v <= hi x (1 + tol).
+inside(float v, float lo, float hi, float tol) => lo * (1 - tol) <= v and v <= hi * (1 + tol)
+
+//@function The patterns completed by the last swing (C): one candidate per pattern whose ratios fit.
+//@param sw The swing list, oldest first.
+//@param useMask Bits of the patterns that are switched on.
+//@param tol Ratio tolerance (relative).
+//@param prz Zone half-width, share of XA (ABCD: AB).
+//@returns The new candidates.
+matchSwings(array<Swing> sw, int useMask, float tol, float prz) =>
+    array<Cand> out = array.new<Cand>()
+    int n = sw.size()
+    if n >= 3
+        Swing c = sw.get(n - 1)
+        Swing b = sw.get(n - 2)
+        Swing a = sw.get(n - 3)
+        bool  bull = c.kind == 1                    // C is a high: D below it
+        float s = bull ? 1.0 : -1.0
+        float abLeg = math.abs(a.price - b.price)
+        float bcLeg = math.abs(c.price - b.price)
+        if abLeg > 0 and bcLeg > 0
+            for pat = 0 to array.size(PATTERN_NAMES) - 1
+                if hasBit(useMask, pat)
+                    float bLo = RATIOS.get(pat * 7)
+                    float bHi = RATIOS.get(pat * 7 + 1)
+                    float cLo = RATIOS.get(pat * 7 + 2)
+                    float cHi = RATIOS.get(pat * 7 + 3)
+                    float dK  = RATIOS.get(pat * 7 + 4)
+                    float pLo = RATIOS.get(pat * 7 + 5)
+                    float pHi = RATIOS.get(pat * 7 + 6)
+                    bool  ok = true
+                    float key = na
+                    float scale = na
+                    int   xb = -1
+                    float xp = na
+                    if pat == 0
+                        ok := inside(bcLeg / abLeg, cLo, cHi, tol)
+                        key := c.price - s * abLeg
+                        scale := abLeg
+                    else if n < 4
+                        ok := false
+                    else
+                        Swing x = sw.get(n - 4)
+                        float xaLeg = math.abs(a.price - x.price)
+                        ok := xaLeg > 0 and inside(abLeg / xaLeg, bLo, bHi, tol) and inside(bcLeg / abLeg, cLo, cHi, tol)
+                        if ok
+                            key := a.price - s * dK * xaLeg
+                            ok := pLo <= 0 or inside(math.abs(c.price - key) / bcLeg, pLo, pHi, tol)
+                            scale := xaLeg
+                            xb := x.bar
+                            xp := x.price
+                    if ok and s * (c.price - key) > 0
+                        out.push(Cand.new(pat, bull ? 1 : -1, key, scale, key + s * prz * scale, key - s * prz * scale, xb, a.bar, b.bar, c.bar, xp, a.price, b.price, c.price))
+    out
+
+//@function Feeds one bar to a candidate. A bar beyond C ends it; the first bar whose extreme since C reaches the zone's
+// near edge completes it, unless a close since C went beyond the far edge (then it is void).
+//@param cd The candidate (updated in place).
+//@param j Bar index of the bar fed.
+//@param h High of that bar.
+//@param l Low of that bar.
+//@param c Close of that bar.
+//@param evs Completed patterns of the current bar (a new one is appended).
+//@param fireAt The bar the completion is dated on: the current bar, never earlier.
+//@returns true while the candidate is still waiting.
+step(Cand cd, int j, float h, float l, float c, array<Event> evs, int fireAt) =>
+    bool alive = true
+    bool bull = cd.dir > 0
+    if bull ? h > cd.cp : l < cd.cp
+        alive := false                              // beyond C: C moves, the pattern ends
+    else
+        float x = bull ? l : h
+        if na(cd.ext) or (bull ? x < cd.ext : x > cd.ext)
+            cd.ext := x
+            cd.extBar := j
+        if na(cd.worst) or (bull ? c < cd.worst : c > cd.worst)
+            cd.worst := c
+        if bull ? cd.ext <= cd.nearZ : cd.ext >= cd.nearZ
+            alive := false
+            if not (bull ? cd.worst < cd.farZ : cd.worst > cd.farZ)
+                evs.push(Event.new(fireAt, cd.dir, cd.pat, cd.xb, cd.ab, cd.bb, cd.cb, cd.extBar, cd.xp, cd.ap, cd.bp, cd.cp, cd.ext, cd.nearZ, cd.farZ))
+    alive
+
+//@function The pattern engine: swings, candidates and completions, one bar per call (call it on every bar).
+//@param useMask Bits of the patterns that are switched on.
+//@param left Swing bars on the left.
+//@param right Swing bars on the right.
+//@param tol Ratio tolerance (relative).
+//@param prz Zone half-width, share of XA (ABCD: AB).
+//@returns The patterns this bar completed.
+harmonic(int useMask, int left, int right, float tol, float prz) =>
+    var array<Swing> sw = array.new<Swing>()
+    var array<Cand> cands = array.new<Cand>()
+    array<Event> evs = array.new<Event>()
+    int t = bar_index
+    // 1) the waiting candidates take this bar
+    array<Cand> alive = array.new<Cand>()
+    for cd in cands
+        if step(cd, t, high, low, close, evs, t)
+            alive.push(cd)
+    cands := alive
+    // 2) a pivot at p = t - right is confirmed now
+    int p = t - right
+    if p - left >= 0
+        float ph = high[right]
+        float pl = low[right]
+        bool isH = true
+        bool isL = true
+        for j = 1 to left
+            isH := isH and ph > high[right + j]
+            isL := isL and pl < low[right + j]
+        for j = 1 to right
+            isH := isH and ph >= high[right - j]
+            isL := isL and pl <= low[right - j]
+        bool skip = false
+        if isH and isL
+            if sw.size() == 0
+                skip := true
+            else
+                // both: only the type that alternates with the last swing
+                int lastKind = sw.last().kind
+                isH := lastKind == -1
+                isL := lastKind == 1
+        bool changed = false
+        if not skip
+            for typ in array.from(1, -1)
+                if typ == 1 ? isH : isL
+                    float px = typ == 1 ? ph : pl
+                    int n = sw.size()
+                    if n > 0 and sw.last().kind == typ
+                        if typ == 1 ? px > sw.last().price : px < sw.last().price
+                            sw.set(n - 1, Swing.new(typ, px, p))
+                            changed := true
+                    // a swing on the wrong side of the last one (a low at or above the last high) is ignored
+                    else if n == 0 or (typ == -1 ? px < sw.last().price : px > sw.last().price)
+                        sw.push(Swing.new(typ, px, p))
+                        if sw.size() > MAX_SWINGS
+                            sw.shift()
+                        changed := true
+        if changed
+            // 3) a new C: new candidates, which catch up on the bars after C (none of them is beyond C)
+            array<Cand> fresh = matchSwings(sw, useMask, tol, prz)
+            array<Cand> kept = array.new<Cand>()
+            for cd in fresh
+                bool ok = true
+                for j = cd.cb + 1 to t
+                    if ok
+                        int k = t - j
+                        ok := step(cd, j, high[k], low[k], close[k], evs, t)
+                if ok
+                    kept.push(cd)
+            cands := kept
+    evs
+
+// ───────────────────────────── Calculations ─────────────────────────────
+int useMask = (useAbcd ? bit(0) : 0) + (useGartley ? bit(1) : 0) + (useBat ? bit(2) : 0)
+array<Event> evs = harmonic(useMask, leftBars, rightBars, tolPct / 100.0, zonePct / 100.0)
+
+int bullMask = 0
+int bearMask = 0
+for e in evs
+    if e.dir > 0 and not hasBit(bullMask, e.pat)
+        bullMask += bit(e.pat)
+    if e.dir < 0 and not hasBit(bearMask, e.pat)
+        bearMask += bit(e.pat)
+
+// Only a closed bar counts: on the live bar nothing is drawn or alerted until it closes.
+bool closed  = barstate.isconfirmed
+bool bullNow = closed and bullMask > 0
+bool bearNow = closed and bearMask > 0
+
+// ───────────────────────────── Plots ─────────────────────────────
+plotshape(bullNow, "Bullish pattern", shape.triangleup, location.belowbar, bullColor, size = size.tiny)
+plotshape(bearNow, "Bearish pattern", shape.triangledown, location.abovebar, bearColor, size = size.tiny)
+// The masks, for the Data Window and for other scripts: bit 0 ABCD, 1 Gartley, 2 Bat.
+plot(closed ? bullMask : na, "Bullish patterns (bit mask)", display = display.data_window)
+plot(closed ? bearMask : na, "Bearish patterns (bit mask)", display = display.data_window)
+
+// Point labels already drawn (bar x 2 + 1 for a high), so patterns that share a swing share its label.
+var array<int> labelled = array.new<int>()
+
+//@function Draws a point label once.
+//@param b Bar of the point.
+//@param price Price of the point.
+//@param txt Label text.
+//@param col Colour.
+//@param high True for a swing high (label above).
+//@returns Nothing.
+pointLabel(int b, float price, string txt, color col, bool high) =>
+    int id = b * 2 + (high ? 1 : 0)
+    if not labelled.includes(id)
+        labelled.push(id)
+        if labelled.size() > 1000
+            labelled.shift()
+        label.new(b, price, txt, style = high ? label.style_label_down : label.style_label_up, color = color.new(col, 100), textcolor = col, size = size.small)
+
+if closed and evs.size() > 0
+    string dText = ""
+    for e in evs
+        color col = e.dir > 0 ? bullColor : bearColor
+        bool bull = e.dir > 0
+        if showLines
+            if e.xb >= 0
+                line.new(e.xb, e.xp, e.ab, e.ap, color = col, width = 2)
+                line.new(e.xb, e.xp, e.bb, e.bp, color = col, style = line.style_dotted)
+            else
+                line.new(e.ab, e.ap, e.cb, e.cp, color = col, style = line.style_dotted)
+            line.new(e.ab, e.ap, e.bb, e.bp, color = col, width = 2)
+            line.new(e.bb, e.bp, e.cb, e.cp, color = col, width = 2)
+            line.new(e.cb, e.cp, e.db, e.dp, color = col, width = 2)
+            line.new(e.bb, e.bp, e.db, e.dp, color = col, style = line.style_dotted)
+        if showZone
+            box.new(e.cb, math.max(e.nearZ, e.farZ), e.bar + ZONE_BARS, math.min(e.nearZ, e.farZ), border_color = col, border_style = line.style_dotted, bgcolor = color.new(col, 92))
+        if showLabels
+            if e.xb >= 0
+                pointLabel(e.xb, e.xp, "X", col, not bull)
+            pointLabel(e.ab, e.ap, "A", col, bull)
+            pointLabel(e.bb, e.bp, "B", col, not bull)
+            pointLabel(e.cb, e.cp, "C", col, bull)
+    if showLabels
+        // D: one label per direction listing every pattern that completed there
+        for dir in array.from(1, -1)
+            int mask = dir > 0 ? bullMask : bearMask
+            if mask > 0
+                Event first = na
+                for e in evs
+                    if e.dir == dir and na(first)
+                        first := e
+                color col = dir > 0 ? bullColor : bearColor
+                label.new(first.db, first.dp, "D  " + maskNames(mask), style = dir > 0 ? label.style_label_up : label.style_label_down, color = color.new(col, 100), textcolor = col, size = size.small)
+
+// ───────────────────────────── Alerts ─────────────────────────────
+// One alert per closed bar, naming every pattern that reached its zone. Create it with "Any alert() function call".
+if bullNow or bearNow
+    string msg = syminfo.ticker + " " + timeframe.period + ": "
+    if bullNow
+        msg += "bullish " + maskNames(bullMask) + " reached the reversal zone"
+    if bearNow
+        msg += (bullNow ? "; " : "") + "bearish " + maskNames(bearMask) + " reached the reversal zone"
+    alert(msg, alert.freq_once_per_bar_close)
+
+alertcondition(bullNow, "Bullish pattern", "Bullish harmonic pattern reached its zone on {{ticker}} {{interval}}")
+alertcondition(bearNow, "Bearish pattern", "Bearish harmonic pattern reached its zone on {{ticker}} {{interval}}")
